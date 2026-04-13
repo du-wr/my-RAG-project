@@ -1,0 +1,42 @@
+# 本地配置
+.env
+env
+.venv/
+venv/
+
+# IDE 与缓存
+.idea/
+__pycache__/
+src/__pycache__/
+*.py[cod]
+
+# 构建与发布
+build/
+dist/
+*.egg-info/
+
+# 测试与缓存
+.pytest_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# 运行时生成数据
+data/**/debug_data/
+data/**/databases/
+data/**/databases_ser_tab/
+data/**/mineru_test/
+data/**/answers_*.json
+*.zip
+
+.hf_pdf_extract_kit/
+.modelscope_cache/
+magic-pdf.json
+.env
+data/test_set/databases/
+data/test_set/debug_data/
+data/test_set/mineru_test/
+
+env
+.env.example
