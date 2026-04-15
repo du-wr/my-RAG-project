@@ -1,8 +1,3 @@
-﻿import inspect
-import re
-
-
-
 def build_system_prompt(instruction: str = "", example: str = "") -> str:
     delimiter = "\n\n---\n\n"
     if example:

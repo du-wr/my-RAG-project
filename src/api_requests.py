@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Dict, List, Literal, Type
+from typing import List, Literal, Type
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -200,41 +200,6 @@ class APIProcessor:
         self.response_data = self.processor.response_data
         return result
 
-    def _build_rag_context_prompts(self, schema: str):
-        import src.prompts as prompts
-
-        if schema == "name":
-            return (
-                prompts.AnswerWithRAGContextNamePrompt.system_prompt,
-                prompts.AnswerWithRAGContextNamePrompt.AnswerSchema,
-                prompts.AnswerWithRAGContextNamePrompt.user_prompt,
-            )
-        if schema == "number":
-            return (
-                prompts.AnswerWithRAGContextNumberPrompt.system_prompt,
-                prompts.AnswerWithRAGContextNumberPrompt.AnswerSchema,
-                prompts.AnswerWithRAGContextNumberPrompt.user_prompt,
-            )
-        if schema == "boolean":
-            return (
-                prompts.AnswerWithRAGContextBooleanPrompt.system_prompt,
-                prompts.AnswerWithRAGContextBooleanPrompt.AnswerSchema,
-                prompts.AnswerWithRAGContextBooleanPrompt.user_prompt,
-            )
-        if schema == "names":
-            return (
-                prompts.AnswerWithRAGContextNamesPrompt.system_prompt,
-                prompts.AnswerWithRAGContextNamesPrompt.AnswerSchema,
-                prompts.AnswerWithRAGContextNamesPrompt.user_prompt,
-            )
-        if schema == "comparative":
-            return (
-                prompts.ComparativeAnswerPrompt.system_prompt,
-                prompts.ComparativeAnswerPrompt.AnswerSchema,
-                prompts.ComparativeAnswerPrompt.user_prompt,
-            )
-        raise ValueError(f"Unsupported schema: {schema}")
-
     @staticmethod
     def _resolve_answer_shape_hint(question_kind_hint: str | None) -> str:
         """将题型提示映射为更明确的答案形态，帮助统一 prompt 收敛输出。"""
@@ -246,31 +211,6 @@ class APIProcessor:
             "comparative": "single_company_or_company_list_or_na",
         }
         return mapping.get(question_kind_hint or "", "unknown")
-
-    def get_answer_from_rag_context(self, question: str, rag_context: str, schema: str, model: str):
-        system_prompt, response_format, user_prompt = self._build_rag_context_prompts(schema)
-        answer_dict = self.send_message(
-            model=model,
-            system_content=system_prompt,
-            human_content=user_prompt.format(context=rag_context, question=question),
-            is_structured=True,
-            response_format=response_format,
-        )
-        return answer_dict
-
-    def get_rephrased_questions(self, original_question: str, companies: List[str]) -> Dict[str, str]:
-        import src.prompts as prompts
-
-        answer_dict = self.send_message(
-            system_content=prompts.RephrasedQuestionsPrompt.system_prompt,
-            human_content=prompts.RephrasedQuestionsPrompt.user_prompt.format(
-                question=original_question,
-                companies=", ".join([f'"{company}"' for company in companies]),
-            ),
-            is_structured=True,
-            response_format=prompts.RephrasedQuestionsPrompt.RephrasedQuestions,
-        )
-        return {item["company_name"]: item["question"] for item in answer_dict["questions"]}
 
     def classify_question_kind(self, question: str, companies: List[str], model: str):
         """使用轻量模型对问题做题型分类，为统一问答 prompt 提供显式 hint。"""

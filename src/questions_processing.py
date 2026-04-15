@@ -766,7 +766,7 @@ class QuestionsProcessor:
         return None
 
     def _normalize_numeric_text_answer_strict(self, question: str, raw_value: str) -> Optional[dict]:
-        """更严格地将文本数值答案规范化为单个可比较数值。"""
+        """ä¸¥æ ¼å°ææ¬æ°å¼ç­æ¡å½ä¸åä¸ºå¯æ¯è¾çåä¸ªæ°å¼ã"""
         text = (raw_value or "").strip()
         if not text or text == "N/A":
             return None
@@ -796,7 +796,7 @@ class QuestionsProcessor:
         return self._normalize_numeric_answer_strict(question, answer_dict)
 
     def _normalize_numeric_answer_strict(self, question: str, answer_dict: dict) -> Optional[dict]:
-        """统一校验数值题的值与单位，确保单值、单位可靠且便于后续比较。"""
+        """ç»ä¸æ ¡éªæ°å¼é¢çå¼ä¸åä½ï¼ç¡®ä¿åå¼ãåä½å¯é ä¸ä¾¿äºåç»­æ¯è¾ã"""
         final_answer = answer_dict.get("final_answer")
         if isinstance(final_answer, bool) or isinstance(final_answer, list):
             return None
@@ -846,7 +846,7 @@ class QuestionsProcessor:
         }
 
     def _normalize_name_answer_strict(self, question: str, final_answer) -> Optional[str]:
-        """更严格地校验字段题，过滤表头、签名栏和格式不合法的脏值。"""
+        """ä¸¥æ ¼æ ¡éªå­æ®µé¢ç­æ¡ï¼è¿æ»¤è¡¨å¤´ãç­¾åæ åæ ¼å¼ä¸åæ³çèå¼ã"""
         if final_answer is None:
             return None
 
@@ -891,7 +891,7 @@ class QuestionsProcessor:
         return text
 
     def _get_numeric_comparison_unit(self, question: str, answer_dict: dict) -> Optional[str]:
-        """提取可用于程序比较的标准单位键，不可比较时返回 None。"""
+        """æåå¯ç¨äºç¨åºæ¯è¾çæ ååä½é®ï¼ä¸å¯æ¯è¾æ¶è¿å Noneã"""
         final_answer = answer_dict.get("final_answer")
         if not isinstance(final_answer, (int, float)) or isinstance(final_answer, bool):
             return None
@@ -901,87 +901,6 @@ class QuestionsProcessor:
             return "元" if answer_unit == "元" else None
 
         if answer_unit is None:
-            return "unitless"
-        if self._is_ratio_or_per_share_metric(question):
-            return answer_unit if answer_unit in {"元/股", "%", "百分点", "unitless"} else None
-        return answer_unit
-
-    def _normalize_numeric_text_answer(self, question: str, raw_value: str) -> Optional[dict]:
-        """将模型返回的文本数值答案规范化为单个数值，并尽量补充单位信息。"""
-        text = (raw_value or "").strip()
-        if not text or text == "N/A":
-            return None
-
-        # 同时出现多个年份时，通常表示模型返回了多期文本，不再冒险自动抽取。
-        if len(re.findall(r"20\d{2}", text)) >= 2:
-            return None
-
-        matches = list(
-            re.finditer(r"(-?\d[\d,]*(?:\.\d+)?)\s*(亿元|万元|千元|元/股|元|%|个百分点|个)?", text)
-        )
-        if len(matches) != 1:
-            return None
-
-        match = matches[0]
-        number_text = match.group(1).replace(",", "")
-        unit_text = match.group(2) or ""
-        try:
-            value = float(number_text)
-        except ValueError:
-            return None
-
-        unit_basis = None
-        answer_unit = None
-        if self._is_money_metric(question):
-            if unit_text == "亿元":
-                value *= 100000000
-                answer_unit = "元"
-                unit_basis = "原文单位为亿元，已换算为元"
-            elif unit_text == "万元":
-                value *= 10000
-                answer_unit = "元"
-                unit_basis = "原文单位为万元，已换算为元"
-            elif unit_text == "千元":
-                value *= 1000
-                answer_unit = "元"
-                unit_basis = "原文单位为千元，已换算为元"
-            else:
-                answer_unit = "元" if unit_text in {"元", ""} else unit_text
-                if unit_text == "元":
-                    unit_basis = "原文单位为元"
-        else:
-            answer_unit = unit_text or None
-            if unit_text:
-                unit_basis = f"原文单位为{unit_text}"
-
-        if value.is_integer():
-            value = int(value)
-
-        return {
-            "final_answer": value,
-            "answer_type": "number",
-            "answer_unit": answer_unit,
-            "unit_basis": unit_basis,
-        }
-
-    def _normalize_name_answer(self, question: str, final_answer) -> Optional[str]:
-        """对字段题做轻量规则校验，过滤明显的签名栏、表头和脏文本。"""
-        if final_answer is None:
-            return None
-
-        text = str(final_answer).strip()
-        if not text or text == "N/A":
-            return None
-
-        if "股票代码" in question:
-            match = re.search(r"\b\d{6}\b", text)
-            return match.group(0) if match else None
-
-        if "网址" in question or "网站" in question:
-            match = re.search(r"(https?://[^\s]+|www\.[^\s]+)", text, flags=re.IGNORECASE)
-            return match.group(1).rstrip("。；;，,") if match else None
-
-        if "法定代表人" in question:
             if any(token in text for token in ["负责人", "签名", "财务报表", "会计机构", "主管会计"]):
                 return self._extract_first_company_name(text)
             candidate = self._extract_first_company_name(text)
@@ -990,7 +909,7 @@ class QuestionsProcessor:
         return text
 
     def _normalize_boolean_answer(self, final_answer):
-        """将布尔题返回结果规整为 True/False/N/A。"""
+        """å°å¸å°é¢è¿åç»æè§æ´ä¸º TrueãFalse æ N/Aã"""
         if isinstance(final_answer, bool):
             return final_answer
 
@@ -1056,6 +975,7 @@ class QuestionsProcessor:
             return self._set_answer_to_na(answer_dict, "列表题未返回列表结构，已降级为 N/A")
 
         return answer_dict
+
 
     def get_answer_for_company(self, company_name: str, question: str, schema: str) -> dict:
         # 先尝试规则捷径，命中后可以直接绕开高成本的检索与问答调用。
@@ -1291,7 +1211,8 @@ class QuestionsProcessor:
             }
 
         retriever = self._build_retriever()
-        retrieval_results = self._retrieve_context_for_company_interactive(retriever, company_name, question_text)
+        # 交互问答默认与批处理共用同一条检索链，保证行为一致并降低交互链额外放大召回带来的显存压力。
+        retrieval_results = self._retrieve_context_for_company(retriever, company_name, question_text)
         if not retrieval_results:
             return {
                 'question_text': question_text,

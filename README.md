@@ -30,6 +30,7 @@ RAG_System_Learning/
 │   ├── interactive_prompts.py
 │   ├── mineru_parsing.py
 │   ├── pipeline.py
+│   ├── question_classification_prompts.py
 │   ├── questions_processing.py
 │   ├── reranking.py
 │   ├── reranking_prompts.py
@@ -63,13 +64,20 @@ pip install -r requirements.txt
 ```env
 QWEN_API_KEY=
 QWEN_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-QWEN_CHAT_MODEL=qwen3.6-plus
+QWEN_CHAT_MODEL=glm-5
 
 EMBEDDING_MODEL=D:\AI_Cache\modelscope\BAAI\bge-m3
 EMBEDDING_DEVICE=cuda
 
-CROSS_ENCODER_MODEL=BAAI/bge-reranker-v2-m3
+CROSS_ENCODER_MODEL=D:\AI_Cache\modelscope\BAAI\bge-reranker-v2-m3
 CROSS_ENCODER_DEVICE=cuda
+
+QUESTION_PARALLEL_REQUESTS=1
+INTERACTIVE_MAX_OUTPUT_TOKENS=800
+
+QUESTION_KIND_MODEL=qwen3.5-flash
+QUESTION_KIND_CONFIDENCE_THRESHOLD=0.75
+QUESTION_KIND_MAX_OUTPUT_TOKENS=200
 
 HNSW_M=32
 HNSW_EF_CONSTRUCTION=80
@@ -190,4 +198,3 @@ cd D:\35174\Desktop\RAG_System_Learning\data\test_set
 - 表格型数值问题的稳定抽取
 - 多公司问题的检索与聚合
 - 交互问答的证据组织与解释能力
-
