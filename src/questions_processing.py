@@ -1,5 +1,6 @@
 import concurrent.futures
 import json
+import os
 import re
 import threading
 from difflib import SequenceMatcher
@@ -63,6 +64,20 @@ class QuestionsProcessor:
         self._company_alias_lookup = None
         self._company_embedding_client = None
         self._company_embedding_vectors = None
+        self.question_kind_model = (os.getenv("QUESTION_KIND_MODEL") or "").strip() or None
+        self.question_kind_confidence_threshold = self._get_env_float("QUESTION_KIND_CONFIDENCE_THRESHOLD", 0.75)
+        self._question_kind_cache = {}
+
+    @staticmethod
+    def _get_env_float(env_key: str, default: float) -> float:
+        """读取浮点环境变量，解析失败时回退到默认值。"""
+        raw_value = os.getenv(env_key)
+        if not raw_value:
+            return default
+        try:
+            return float(raw_value)
+        except ValueError:
+            return default
 
     def _load_questions(self, questions_file_path: Optional[Union[str, Path]]) -> List[Dict[str, str]]:
         if questions_file_path is None:
@@ -276,7 +291,7 @@ class QuestionsProcessor:
         normalized_question = self._normalize_company_text(remaining_text)
         found_companies = []
 
-        # ?????????????????????????????
+        # 先按公司全名做直接匹配，命中时优先返回，避免后续模糊匹配误伤。
         for company in sorted(self.companies_df["company_name"].dropna().unique(), key=len, reverse=True):
             if company and company in remaining_text and company not in found_companies:
                 found_companies.append(company)
@@ -285,7 +300,7 @@ class QuestionsProcessor:
         if found_companies:
             return found_companies
 
-        # ?????????????????????????????????
+        # 再尝试别名、归一化文本和子序列匹配，兼容简称、全称与不同提问写法。
         matched_companies = []
         for entry in self._build_company_alias_lookup():
             company_name = entry["company_name"]
@@ -306,7 +321,7 @@ class QuestionsProcessor:
         if matched_companies:
             return matched_companies
 
-        # ???????????????????????
+        # 最后回退到模糊匹配与向量相似度匹配。
         fuzzy_matched = self._resolve_companies_with_fuzzy_match(question_text)
         if fuzzy_matched:
             return fuzzy_matched
@@ -352,7 +367,7 @@ class QuestionsProcessor:
         )
 
     def _build_interactive_queries(self, company_name: str, question: str) -> List[str]:
-        """????????????????????????????"""
+        """为交互检索构造多个查询变体，提升不同问法下的召回率。"""
         question = (question or '').strip()
         if not question:
             return []
@@ -360,7 +375,7 @@ class QuestionsProcessor:
         queries = [question]
         candidate_variants = []
 
-        # ????????????? + ? + ?????????????????????
+        # 优先尝试“公司名 + 的 + 问题主体”的常见结构，抽出公司名后的问题部分。
         if "的" in question:
             candidate_variants.append(question.split("的", 1)[1].strip())
 
@@ -381,8 +396,8 @@ class QuestionsProcessor:
         candidate_variants.append(stripped_question)
 
         for variant in candidate_variants:
-            simplified_question = re.sub(r'^[的\s:?,?]+', '', (variant or '')).strip()
-            simplified_question = re.sub(r'[???.]$', '', simplified_question).strip()
+            simplified_question = re.sub('[\s:\uFF1A,\uFF0C\u3002\uFF1B;\uFF1F?\u7684]+', '', (variant or '')).strip()
+            simplified_question = re.sub('[\u3002\uFF1B;\uFF1F?.]+$', '', simplified_question).strip()
             simplified_question = re.sub(r'\s+', ' ', simplified_question).strip()
             if simplified_question and simplified_question not in queries:
                 queries.append(simplified_question)
@@ -390,7 +405,7 @@ class QuestionsProcessor:
             keyword_question = simplified_question
             for filler in ["请问", "一下", "情况", "相关情况", "总计是多少", "是多少", "是什么"]:
                 keyword_question = keyword_question.replace(filler, ' ')
-            keyword_question = re.sub(r'\s+', ' ', keyword_question).strip(' ?,?.??')
+            keyword_question = re.sub(r'\s+', ' ', keyword_question).strip(' :\uFF1A,\uFF0C\u3002\uFF1B;\uFF1F?')
             if len(keyword_question) >= 4 and keyword_question not in queries:
                 queries.append(keyword_question)
 
@@ -406,11 +421,11 @@ class QuestionsProcessor:
         return 0.0
 
     def _is_table_value_question(self, question: str) -> bool:
-        """???????????????????????????"""
+        """识别更依赖表格块而非正文段落的数值型问题。"""
         question = (question or '').strip()
         table_keywords = [
-            '??????', '??????', '????', '????', '????', '????', '??????',
-            '??????', '????', '????', '??', '??', '????', '??:?',
+            '账面价值', '期末账面价值', '账面余额', '期末余额', '公允价值', '减值准备', '资产情况',
+            '负债情况', '使用权资产', '固定资产', '无形资产', '项目', '合计', '单位：',
         ]
         return any(keyword in question for keyword in table_keywords)
 
@@ -421,7 +436,7 @@ class QuestionsProcessor:
         return score
 
     def _merge_retrieval_results(self, result_groups: List[List[Dict]], top_n: int, prefer_table_chunks: bool = False) -> List[Dict]:
-        """??????????????????????????????"""
+        """合并多轮检索结果并去重，再按重排分数截取前 top_n 条。"""
         merged = {}
         for group in result_groups:
             for item in group:
@@ -436,7 +451,7 @@ class QuestionsProcessor:
         return results[:top_n]
 
     def _retrieve_context_for_company_interactive(self, retriever, company_name: str, question: str) -> List[Dict]:
-        """?????????????????????????????"""
+        """交互问答优先提升召回覆盖率，因此会使用更激进的查询扩展。"""
         if self.full_context:
             return retriever.retrieve_all(company_name)
 
@@ -460,16 +475,82 @@ class QuestionsProcessor:
 
         return self._merge_retrieval_results(result_groups, interactive_top_n, prefer_table_chunks=prefer_table_chunks)
 
+    def _resolve_schema(
+        self,
+        question_text: str,
+        schema: Optional[str],
+        extracted_companies: Optional[List[str]] = None,
+    ) -> str:
+        """统一处理显式 schema 与自动推断的回退逻辑。"""
+        if schema and schema not in {"auto", "general"}:
+            return schema
+        return self.infer_schema_for_question(question_text, extracted_companies=extracted_companies)
+
+
+    @staticmethod
+    def _clean_field_value(value: str) -> Optional[str]:
+        """清洗基础字段抽取结果，去掉表格分隔符和明显的表头噪声。"""
+        value = (value or "").strip()
+        if not value:
+            return None
+
+        value = re.sub(r"^[|｜:：\-\s]+", "", value)
+        value = re.sub(r"[|｜\s]+$", "", value)
+        value = value.strip(" ：:；;，,。 ")
+
+        invalid_values = {
+            "股票代码",
+            "股票简称",
+            "变更前股票代码",
+            "变更前股票简称",
+            "法定代表人",
+            "公司法定代表人",
+            "公司网址",
+            "公司网站",
+            "网址",
+            "网站",
+            "电子邮箱",
+            "电子信箱",
+            "办公地址",
+            "注册地址",
+        }
+        if not value or value in invalid_values:
+            return None
+        return value
+
+    @classmethod
+    def _extract_adjacent_table_value(cls, line: str, labels: List[str]) -> Optional[str]:
+        """处理表格行，优先抽取字段右侧相邻单元格的值。"""
+        cells = [cell.strip() for cell in re.split(r"[|｜]", line)]
+        if len(cells) < 2:
+            return None
+
+        for index, cell in enumerate(cells):
+            if cell in labels:
+                for candidate in cells[index + 1:]:
+                    cleaned = cls._clean_field_value(candidate)
+                    if cleaned is not None:
+                        return cleaned
+        return None
 
     def _match_field(self, text: str, labels: List[str]) -> Optional[str]:
+        """兼容普通文本和表格文本的基础字段抽取。"""
+        for line in re.split(r"[\n\r]+", text or ""):
+            if not any(label in line for label in labels):
+                continue
+
+            table_value = self._extract_adjacent_table_value(line, labels)
+            if table_value is not None:
+                return table_value
+
         for label in labels:
-            pattern = rf"{re.escape(label)}[\s:：]*([^\n\r\t；;，,]+)"
-            match = re.search(pattern, text)
+            pattern = rf"{re.escape(label)}[\s:：]*([^\n\r\t；;，,|｜]+)"
+            match = re.search(pattern, text or "")
             if not match:
                 continue
 
-            value = match.group(1).strip(" ：:；;，,。 ")
-            if value:
+            value = self._clean_field_value(match.group(1))
+            if value is not None:
                 return value
         return None
 
@@ -529,14 +610,34 @@ class QuestionsProcessor:
 
         return None
 
-    def _extract_numeric_from_text(self, text: str, labels: List[str]) -> Optional[float]:
+    @staticmethod
+    def _resolve_numeric_unit_multiplier(local_text: str, target_field: str) -> float:
+        """根据字段类型和局部文本判断单位倍率，避免对每股指标误乘页面单位。"""
+        if target_field == "基本每股收益":
+            return 1.0
+
+        if "亿元" in local_text:
+            return 100000000.0
+        if "万元" in local_text:
+            return 10000.0
+        if "千元" in local_text:
+            return 1000.0
+        return 1.0
+
+    def _extract_numeric_from_text(self, text: str, labels: List[str], target_field: str) -> Optional[float]:
+        """尽量在字段附近抽取数值，并只按局部单位做换算。"""
         for label in labels:
-            pattern = rf"{re.escape(label)}[^\n\r]*?(-?\(?[\d,]+(?:\.\d+)?\)?)"
-            match = re.search(pattern, text)
+            pattern = rf"([^\n\r]*{re.escape(label)}[^\n\r]*)"
+            match = re.search(pattern, text or "")
             if not match:
                 continue
 
-            raw = match.group(1).replace(",", "").strip()
+            local_line = match.group(1)
+            number_match = re.search(r"(-?\(?[\d,]+(?:\.\d+)?\)?)", local_line)
+            if not number_match:
+                continue
+
+            raw = number_match.group(1).replace(",", "").strip()
             negative = raw.startswith("(") and raw.endswith(")")
             raw = raw.strip("()")
 
@@ -545,10 +646,11 @@ class QuestionsProcessor:
             except ValueError:
                 continue
 
-            if "万元" in text:
-                value *= 10000
-            elif "亿元" in text:
-                value *= 100000000
+            # 只在字段附近和页眉单位提示中判断倍率，避免被页面内其他表格单位误导。
+            unit_window_start = max(0, match.start() - 160)
+            unit_window_end = min(len(text or ""), match.end() + 80)
+            local_unit_text = (text or "")[unit_window_start:unit_window_end]
+            value *= self._resolve_numeric_unit_multiplier(local_unit_text, target_field)
 
             if negative:
                 value = -value
@@ -574,7 +676,7 @@ class QuestionsProcessor:
             return None
 
         for page in doc["content"]["pages"][:20]:
-            value = self._extract_numeric_from_text(page["text"], field_map[target_field])
+            value = self._extract_numeric_from_text(page["text"], field_map[target_field], target_field)
             if value is None:
                 continue
 
@@ -592,11 +694,375 @@ class QuestionsProcessor:
 
         return None
 
+    @staticmethod
+    def _set_answer_to_na(answer_dict: dict, reason: str) -> dict:
+        """将不可信的回答统一降级为 N/A，避免脏答案继续污染比较题和最终输出。"""
+        answer_dict = dict(answer_dict or {})
+        answer_dict["answer_type"] = "na"
+        answer_dict["final_answer"] = "N/A"
+        answer_dict["answer_unit"] = None
+        answer_dict["unit_basis"] = None
+        summary = str(answer_dict.get("reasoning_summary") or "").strip()
+        answer_dict["reasoning_summary"] = reason if not summary else f"{summary}；{reason}"
+        return answer_dict
+
+    @staticmethod
+    def _is_money_metric(question: str) -> bool:
+        """判断问题是否属于金额类指标，便于统一换算为元。"""
+        money_keywords = [
+            "营业收入", "净利润", "归属于上市公司股东的净利润", "归母净利润", "研发投入",
+            "资产", "负债", "现金流", "账面价值", "余额", "金额", "数额", "总额", "总计",
+        ]
+        question = question or ""
+        return any(keyword in question for keyword in money_keywords)
+
+    @staticmethod
+    def _is_ratio_or_per_share_metric(question: str) -> bool:
+        """判断是否属于比例类或每股类指标，这类指标不应被统一换算为元。"""
+        ratio_keywords = [
+            "每股收益", "基本每股收益", "稀释每股收益", "比例", "占比", "增长率",
+            "毛利率", "净利率", "资产负债率", "同比", "百分比", "百分点",
+        ]
+        question = question or ""
+        return any(keyword in question for keyword in ratio_keywords)
+
+    @staticmethod
+    def _normalize_answer_unit(answer_unit) -> Optional[str]:
+        """统一单位写法，减少后续单位比较时的分支数量。"""
+        if answer_unit is None:
+            return None
+
+        text = str(answer_unit).strip()
+        if not text or text.upper() == "N/A":
+            return None
+
+        text = text.replace("人民币", "").replace(" ", "")
+        text = text.rstrip("。；;，,）)")
+        aliases = {
+            "元人民币": "元",
+            "万元人民币": "万元",
+            "亿元人民币": "亿元",
+            "千元人民币": "千元",
+            "百分比": "%",
+            "百分数": "%",
+            "百分点数": "百分点",
+        }
+        return aliases.get(text, text)
+
+    @staticmethod
+    def _extract_first_company_name(text: str) -> Optional[str]:
+        """从文本中提取一个较短的中文人名或公司名片段，用于字段题脏值清洗。"""
+        candidates = re.findall(r"[\u4e00-\u9fff]{2,6}", text or "")
+        invalid_fragments = {
+            "主管会计工作负责人", "会计机构负责人", "财务报表", "公司负责人",
+            "单位负责人", "负责人", "签名并盖章", "报告期内",
+        }
+        for candidate in candidates:
+            if candidate in invalid_fragments:
+                continue
+            if "负责人" in candidate or "报表" in candidate or "签名" in candidate:
+                continue
+            return candidate
+        return None
+
+    def _normalize_numeric_text_answer_strict(self, question: str, raw_value: str) -> Optional[dict]:
+        """更严格地将文本数值答案规范化为单个可比较数值。"""
+        text = (raw_value or "").strip()
+        if not text or text == "N/A":
+            return None
+
+        if len(re.findall(r"20\d{2}", text)) >= 2:
+            return None
+
+        matches = list(
+            re.finditer(r"(-?\d[\d,]*(?:\.\d+)?)\s*(亿元|万元|千元|元/股|元|%|百分点|个百分点|个)?", text)
+        )
+        if len(matches) != 1:
+            return None
+
+        match = matches[0]
+        number_text = match.group(1).replace(",", "")
+        try:
+            value = float(number_text)
+        except ValueError:
+            return None
+
+        answer_dict = {
+            "final_answer": value,
+            "answer_type": "number",
+            "answer_unit": self._normalize_answer_unit(match.group(2) or None),
+            "unit_basis": None,
+        }
+        return self._normalize_numeric_answer_strict(question, answer_dict)
+
+    def _normalize_numeric_answer_strict(self, question: str, answer_dict: dict) -> Optional[dict]:
+        """统一校验数值题的值与单位，确保单值、单位可靠且便于后续比较。"""
+        final_answer = answer_dict.get("final_answer")
+        if isinstance(final_answer, bool) or isinstance(final_answer, list):
+            return None
+
+        try:
+            value = float(final_answer)
+        except (TypeError, ValueError):
+            return None
+
+        answer_unit = self._normalize_answer_unit(answer_dict.get("answer_unit"))
+        unit_basis = str(answer_dict.get("unit_basis") or "").strip() or None
+
+        if self._is_money_metric(question):
+            if answer_unit == "亿元":
+                value *= 100000000
+                answer_unit = "元"
+                unit_basis = unit_basis or "原文单位为亿元，已换算为元"
+            elif answer_unit == "万元":
+                value *= 10000
+                answer_unit = "元"
+                unit_basis = unit_basis or "原文单位为万元，已换算为元"
+            elif answer_unit == "千元":
+                value *= 1000
+                answer_unit = "元"
+                unit_basis = unit_basis or "原文单位为千元，已换算为元"
+            elif answer_unit in {"元", None}:
+                if answer_unit == "元" and not unit_basis:
+                    unit_basis = "原文单位为元"
+            else:
+                return None
+        else:
+            if self._is_ratio_or_per_share_metric(question) and answer_unit in {"亿元", "万元", "千元"}:
+                return None
+            if answer_unit == "个百分点":
+                answer_unit = "百分点"
+            if answer_unit and not unit_basis:
+                unit_basis = f"原文单位为{answer_unit}"
+
+        if float(value).is_integer():
+            value = int(value)
+
+        return {
+            "final_answer": value,
+            "answer_type": "number",
+            "answer_unit": answer_unit,
+            "unit_basis": unit_basis,
+        }
+
+    def _normalize_name_answer_strict(self, question: str, final_answer) -> Optional[str]:
+        """更严格地校验字段题，过滤表头、签名栏和格式不合法的脏值。"""
+        if final_answer is None:
+            return None
+
+        text = str(final_answer).strip()
+        if not text or text == "N/A":
+            return None
+
+        text = re.sub(r"\s+", " ", text).strip(" ：:|;；，,。.\"'“”‘’")
+        if text in {"股票代码", "股票简称", "公司网址", "法定代表人", "注册地址", "办公地址", "电子信箱", "电子邮箱"}:
+            return None
+
+        if "股票代码" in question:
+            match = re.search(r"\b\d{6}\b", text)
+            return match.group(0) if match else None
+
+        if "网址" in question or "网站" in question:
+            match = re.search(r"(https?://[^\s]+|www\.[^\s]+)", text, flags=re.IGNORECASE)
+            return match.group(1).rstrip("。；;，,") if match else None
+
+        if "邮箱" in question or "电子信箱" in question:
+            match = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
+            return match.group(0) if match else None
+
+        if "法定代表人" in question:
+            if any(token in text for token in ["负责人", "签名", "财务报表", "会计机构", "主管会计", "董事会"]):
+                candidate = self._extract_first_company_name(text)
+                return candidate if candidate and len(candidate) <= 4 else None
+            candidate = self._extract_first_company_name(text)
+            if candidate and len(candidate) <= 4:
+                return candidate
+            if re.fullmatch(r"[\u4e00-\u9fff·]{2,8}", text):
+                return text
+            return None
+
+        if "地址" in question:
+            if len(text) < 6 or any(token in text for token in ["签名", "财务报表", "负责人"]):
+                return None
+            return text
+
+        if len(text) > 80:
+            return None
+        return text
+
+    def _get_numeric_comparison_unit(self, question: str, answer_dict: dict) -> Optional[str]:
+        """提取可用于程序比较的标准单位键，不可比较时返回 None。"""
+        final_answer = answer_dict.get("final_answer")
+        if not isinstance(final_answer, (int, float)) or isinstance(final_answer, bool):
+            return None
+
+        answer_unit = self._normalize_answer_unit(answer_dict.get("answer_unit"))
+        if self._is_money_metric(question):
+            return "元" if answer_unit == "元" else None
+
+        if answer_unit is None:
+            return "unitless"
+        if self._is_ratio_or_per_share_metric(question):
+            return answer_unit if answer_unit in {"元/股", "%", "百分点", "unitless"} else None
+        return answer_unit
+
+    def _normalize_numeric_text_answer(self, question: str, raw_value: str) -> Optional[dict]:
+        """将模型返回的文本数值答案规范化为单个数值，并尽量补充单位信息。"""
+        text = (raw_value or "").strip()
+        if not text or text == "N/A":
+            return None
+
+        # 同时出现多个年份时，通常表示模型返回了多期文本，不再冒险自动抽取。
+        if len(re.findall(r"20\d{2}", text)) >= 2:
+            return None
+
+        matches = list(
+            re.finditer(r"(-?\d[\d,]*(?:\.\d+)?)\s*(亿元|万元|千元|元/股|元|%|个百分点|个)?", text)
+        )
+        if len(matches) != 1:
+            return None
+
+        match = matches[0]
+        number_text = match.group(1).replace(",", "")
+        unit_text = match.group(2) or ""
+        try:
+            value = float(number_text)
+        except ValueError:
+            return None
+
+        unit_basis = None
+        answer_unit = None
+        if self._is_money_metric(question):
+            if unit_text == "亿元":
+                value *= 100000000
+                answer_unit = "元"
+                unit_basis = "原文单位为亿元，已换算为元"
+            elif unit_text == "万元":
+                value *= 10000
+                answer_unit = "元"
+                unit_basis = "原文单位为万元，已换算为元"
+            elif unit_text == "千元":
+                value *= 1000
+                answer_unit = "元"
+                unit_basis = "原文单位为千元，已换算为元"
+            else:
+                answer_unit = "元" if unit_text in {"元", ""} else unit_text
+                if unit_text == "元":
+                    unit_basis = "原文单位为元"
+        else:
+            answer_unit = unit_text or None
+            if unit_text:
+                unit_basis = f"原文单位为{unit_text}"
+
+        if value.is_integer():
+            value = int(value)
+
+        return {
+            "final_answer": value,
+            "answer_type": "number",
+            "answer_unit": answer_unit,
+            "unit_basis": unit_basis,
+        }
+
+    def _normalize_name_answer(self, question: str, final_answer) -> Optional[str]:
+        """对字段题做轻量规则校验，过滤明显的签名栏、表头和脏文本。"""
+        if final_answer is None:
+            return None
+
+        text = str(final_answer).strip()
+        if not text or text == "N/A":
+            return None
+
+        if "股票代码" in question:
+            match = re.search(r"\b\d{6}\b", text)
+            return match.group(0) if match else None
+
+        if "网址" in question or "网站" in question:
+            match = re.search(r"(https?://[^\s]+|www\.[^\s]+)", text, flags=re.IGNORECASE)
+            return match.group(1).rstrip("。；;，,") if match else None
+
+        if "法定代表人" in question:
+            if any(token in text for token in ["负责人", "签名", "财务报表", "会计机构", "主管会计"]):
+                return self._extract_first_company_name(text)
+            candidate = self._extract_first_company_name(text)
+            return candidate or text
+
+        return text
+
+    def _normalize_boolean_answer(self, final_answer):
+        """将布尔题返回结果规整为 True/False/N/A。"""
+        if isinstance(final_answer, bool):
+            return final_answer
+
+        text = str(final_answer or "").strip().lower()
+        if not text or text == "n/a":
+            return "N/A"
+
+        positive_tokens = ["true", "是", "已披露", "披露了", "存在", "有", "已实施", "已回购"]
+        negative_tokens = ["false", "否", "未披露", "不存在", "没有", "无", "未实施", "未回购", "不适用"]
+
+        if any(token in text for token in positive_tokens) and not any(token in text for token in negative_tokens):
+            return True
+        if any(token in text for token in negative_tokens):
+            return False
+        return "N/A"
+
+    def _validate_answer_dict(self, question: str, schema: str, answer_dict: dict) -> dict:
+        """统一答案校验层：对不同题型做最小必要校验与归一化。"""
+        answer_dict = dict(answer_dict or {})
+        final_answer = answer_dict.get("final_answer")
+
+        if final_answer == "N/A" or final_answer is None:
+            answer_dict["answer_type"] = "na"
+            answer_dict["answer_unit"] = None
+            answer_dict["unit_basis"] = None
+            return answer_dict
+
+        if schema == "number":
+            if isinstance(final_answer, bool) or isinstance(final_answer, list):
+                return self._set_answer_to_na(answer_dict, "数值题返回结果类型不合法，已降级为 N/A")
+
+            if isinstance(final_answer, str):
+                normalized = self._normalize_numeric_text_answer_strict(question, final_answer)
+            else:
+                normalized = self._normalize_numeric_answer_strict(question, answer_dict)
+            if normalized is None:
+                return self._set_answer_to_na(answer_dict, "数值题未能稳定归一化为单个数值，已降级为 N/A")
+            answer_dict.update(normalized)
+            return answer_dict
+
+        if schema == "name":
+            normalized_name = self._normalize_name_answer_strict(question, final_answer)
+            if normalized_name is None:
+                return self._set_answer_to_na(answer_dict, "字段题返回值疑似表头或签名栏噪声，已降级为 N/A")
+            answer_dict["final_answer"] = normalized_name
+            answer_dict["answer_type"] = "text"
+            return answer_dict
+
+        if schema == "boolean":
+            normalized_boolean = self._normalize_boolean_answer(final_answer)
+            if normalized_boolean == "N/A":
+                return self._set_answer_to_na(answer_dict, "布尔题结果无法稳定判定真值，已降级为 N/A")
+            answer_dict["final_answer"] = normalized_boolean
+            answer_dict["answer_type"] = "boolean"
+            return answer_dict
+
+        if schema == "names":
+            if isinstance(final_answer, list):
+                cleaned = [str(item).strip() for item in final_answer if str(item).strip()]
+                answer_dict["final_answer"] = cleaned if cleaned else "N/A"
+                answer_dict["answer_type"] = "list" if cleaned else "na"
+                return answer_dict
+            return self._set_answer_to_na(answer_dict, "列表题未返回列表结构，已降级为 N/A")
+
+        return answer_dict
+
     def get_answer_for_company(self, company_name: str, question: str, schema: str) -> dict:
-        # ????????????????????????????????????
+        # 先尝试规则捷径，命中后可以直接绕开高成本的检索与问答调用。
         if self.enable_rule_shortcuts and schema == "name":
             shortcut = self._try_basic_info_shortcut(company_name, question)
             if shortcut is not None:
+                shortcut = self._validate_answer_dict(question, schema, shortcut)
                 shortcut["route"] = "rule"
                 shortcut["status"] = "answered" if shortcut.get("final_answer") != "N/A" else "insufficient_evidence"
                 shortcut["resolved_company_names"] = [company_name]
@@ -605,29 +1071,13 @@ class QuestionsProcessor:
         if self.enable_rule_shortcuts and schema == "number":
             shortcut = self._try_numeric_shortcut(company_name, question)
             if shortcut is not None:
+                shortcut = self._validate_answer_dict(question, schema, shortcut)
                 shortcut["route"] = "rule"
                 shortcut["status"] = "answered" if shortcut.get("final_answer") != "N/A" else "insufficient_evidence"
                 shortcut["resolved_company_names"] = [company_name]
                 return shortcut
 
-        if self.llm_reranking:
-            retriever = HybridRetriever(
-                vector_db_dir=self.vector_db_dir,
-                documents_dir=self.documents_dir,
-                bm25_db_dir=self.bm25_db_dir,
-                provider=self.api_provider,
-                rerank_strategy=self.reranking_strategy,
-                rerank_model=self.answering_model,
-                embedding_model=self.embedding_model,
-                cross_encoder_model=self.cross_encoder_model,
-            )
-        else:
-            retriever = VectorRetriever(
-                vector_db_dir=self.vector_db_dir,
-                documents_dir=self.documents_dir,
-                embedding_model=self.embedding_model,
-                provider=self.api_provider,
-            )
+        retriever = self._build_retriever()
 
         if self.full_context:
             retrieval_results = retriever.retrieve_all(company_name)
@@ -644,20 +1094,19 @@ class QuestionsProcessor:
             raise ValueError("No relevant context found")
 
         rag_context = self._format_retrieval_results(retrieval_results)
-        answer_dict = self.openai_processor.get_answer_from_rag_context(
+        answer_dict = self.openai_processor.get_interactive_answer_from_rag_context(
             question=question,
             rag_context=rag_context,
-            schema=schema,
+            companies=[company_name],
             model=self.answering_model,
+            question_kind_hint=schema,
         )
+        answer_dict = self._validate_answer_dict(question, schema, answer_dict)
         self.response_data = self.openai_processor.response_data
 
-        if self.new_challenge_pipeline:
-            pages = answer_dict.get("relevant_pages", [])
-            validated_pages = self._validate_page_references(pages, retrieval_results)
-            answer_dict["relevant_pages"] = validated_pages
-            answer_dict["references"] = self._extract_references(validated_pages, company_name)
-
+        validated_pages = self._validate_page_references(answer_dict.get("relevant_pages", []), retrieval_results)
+        answer_dict["relevant_pages"] = validated_pages
+        answer_dict["references"] = self._extract_references(validated_pages, company_name)
         answer_dict["route"] = "rag"
         answer_dict["status"] = "answered" if answer_dict.get("final_answer") != "N/A" else "insufficient_evidence"
         answer_dict["resolved_company_names"] = [company_name]
@@ -675,8 +1124,8 @@ class QuestionsProcessor:
             return self.get_answer_for_company(extracted_companies[0], question, schema)
         return self.process_comparative_question(question, extracted_companies, schema)
 
-    def infer_schema_for_question(self, question: str) -> str:
-        # ??????????????????????????? name?
+    def _infer_schema_with_rules(self, question: str) -> str:
+        """基于稳定关键词的兜底题型判断。"""
         question = (question or '').strip()
         if not question:
             raise ValueError('Question cannot be empty.')
@@ -716,10 +1165,62 @@ class QuestionsProcessor:
 
         return 'name'
 
+    def _classify_question_kind_with_model(
+        self,
+        question: str,
+        extracted_companies: Optional[List[str]] = None,
+    ) -> Optional[dict]:
+        """使用轻量模型做题型分类，低成本地产生 question_kind_hint。"""
+        if not self.question_kind_model:
+            return None
+
+        cache_key = (question, tuple(extracted_companies or []))
+        if cache_key in self._question_kind_cache:
+            return self._question_kind_cache[cache_key]
+
+        try:
+            classification = self.openai_processor.classify_question_kind(
+                question=question,
+                companies=extracted_companies or [],
+                model=self.question_kind_model,
+            )
+        except Exception:
+            return None
+
+        result = {
+            "predicted_kind": classification.get("predicted_kind"),
+            "confidence": float(classification.get("confidence", 0.0) or 0.0),
+            "reasoning_summary": classification.get("reasoning_summary", ""),
+        }
+        self._question_kind_cache[cache_key] = result
+        return result
+
+    def infer_schema_for_question(self, question: str, extracted_companies: Optional[List[str]] = None) -> str:
+        """优先使用轻量模型做题型分类，低置信度时回退到关键词规则。"""
+        question = (question or '').strip()
+        if not question:
+            raise ValueError('Question cannot be empty.')
+
+        extracted_companies = extracted_companies or []
+        if len(extracted_companies) > 1:
+            return 'comparative'
+
+        classification = self._classify_question_kind_with_model(
+            question=question,
+            extracted_companies=extracted_companies,
+        )
+        if classification is not None:
+            predicted_kind = classification.get("predicted_kind")
+            confidence = classification.get("confidence", 0.0)
+            if predicted_kind and confidence >= self.question_kind_confidence_threshold:
+                return predicted_kind
+
+        return self._infer_schema_with_rules(question)
+
     def answer_single_question(self, question_text: str, schema: Optional[str] = None) -> dict:
-        # ?????????????????????????
+        # 交互问答默认保留查询扩展；批处理会显式关闭该模式，避免调用量失控。
         resolved_companies = self._extract_companies_from_subset(question_text) if self.new_challenge_pipeline else []
-        resolved_kind = schema or 'general'
+        resolved_kind = self._resolve_schema(question_text, schema, extracted_companies=resolved_companies)
 
         if not resolved_companies:
             return {
@@ -752,20 +1253,61 @@ class QuestionsProcessor:
             }
 
         company_name = resolved_companies[0]
+        return self._answer_single_company_question(
+            company_name=company_name,
+            question_text=question_text,
+            resolved_kind=resolved_kind,
+            use_interactive_retrieval=True,
+        )
+
+    def _answer_single_company_question(
+        self,
+        company_name: str,
+        question_text: str,
+        resolved_kind: str,
+        use_interactive_retrieval: bool,
+    ) -> dict:
+        """统一封装单公司问题回答，便于批处理与交互链共享主逻辑。"""
+        if not use_interactive_retrieval:
+            answer_dict = self.get_answer_for_company(company_name, question_text, resolved_kind)
+            return {
+                'question_text': question_text,
+                'resolved_kind': answer_dict.get('answer_type', resolved_kind),
+                'resolved_companies': [company_name],
+                'route': answer_dict.get('route'),
+                'status': answer_dict.get('status'),
+                'value': answer_dict.get('final_answer'),
+                'answer_unit': answer_dict.get('answer_unit'),
+                'unit_basis': answer_dict.get('unit_basis'),
+                'references': answer_dict.get('references', []),
+                'detail': {
+                    'step_by_step_analysis': answer_dict.get('step_by_step_analysis'),
+                    'reasoning_summary': answer_dict.get('reasoning_summary'),
+                    'relevant_pages': answer_dict.get('relevant_pages', []),
+                    'answer_unit': answer_dict.get('answer_unit'),
+                    'unit_basis': answer_dict.get('unit_basis'),
+                    'response_data': getattr(self, 'response_data', None),
+                },
+            }
+
         retriever = self._build_retriever()
         retrieval_results = self._retrieve_context_for_company_interactive(retriever, company_name, question_text)
         if not retrieval_results:
             return {
                 'question_text': question_text,
                 'resolved_kind': resolved_kind,
-                'resolved_companies': resolved_companies,
+                'resolved_companies': [company_name],
                 'route': 'rag',
                 'status': 'insufficient_evidence',
                 'value': 'N/A',
+                'answer_unit': None,
+                'unit_basis': None,
                 'references': [],
                 'detail': {
-                    'reasoning_summary': '????????????????',
+                    'reasoning_summary': '未检索到可直接支持答案的相关上下文。',
                     'relevant_pages': [],
+                    'answer_unit': None,
+                    'unit_basis': None,
                 },
             }
 
@@ -773,9 +1315,11 @@ class QuestionsProcessor:
         answer_dict = self.openai_processor.get_interactive_answer_from_rag_context(
             question=question_text,
             rag_context=rag_context,
-            companies=resolved_companies,
+            companies=[company_name],
             model=self.answering_model,
+            question_kind_hint=resolved_kind,
         )
+        answer_dict = self._validate_answer_dict(question_text, resolved_kind, answer_dict)
         self.response_data = self.openai_processor.response_data
 
         validated_pages = self._validate_page_references(answer_dict.get('relevant_pages', []), retrieval_results)
@@ -786,15 +1330,19 @@ class QuestionsProcessor:
         return {
             'question_text': question_text,
             'resolved_kind': answer_dict.get('answer_type', resolved_kind),
-            'resolved_companies': resolved_companies,
+            'resolved_companies': [company_name],
             'route': 'rag',
             'status': status,
             'value': final_answer,
+            'answer_unit': answer_dict.get('answer_unit'),
+            'unit_basis': answer_dict.get('unit_basis'),
             'references': references,
             'detail': {
                 'step_by_step_analysis': answer_dict.get('step_by_step_analysis'),
                 'reasoning_summary': answer_dict.get('reasoning_summary'),
                 'relevant_pages': validated_pages,
+                'answer_unit': answer_dict.get('answer_unit'),
+                'unit_basis': answer_dict.get('unit_basis'),
                 'response_data': self.response_data,
             },
         }
@@ -806,6 +1354,8 @@ class QuestionsProcessor:
                 "step_by_step_analysis": answer_dict.get("step_by_step_analysis"),
                 "reasoning_summary": answer_dict.get("reasoning_summary"),
                 "relevant_pages": answer_dict.get("relevant_pages"),
+                "answer_unit": answer_dict.get("answer_unit"),
+                "unit_basis": answer_dict.get("unit_basis"),
                 "response_data": getattr(self, "response_data", None),
                 "self": ref_id,
             }
@@ -870,21 +1420,36 @@ class QuestionsProcessor:
         schema = question_data.get("kind") if self.new_challenge_pipeline else question_data.get("schema")
 
         try:
-            answer_dict = self.process_question(question_text, schema)
-            detail_ref = self._create_answer_detail_ref(answer_dict, question_index)
-
             if self.new_challenge_pipeline:
+                resolved_companies = self._extract_companies_from_subset(question_text)
+                if len(resolved_companies) == 1:
+                    resolved_kind = self._resolve_schema(question_text, schema, extracted_companies=resolved_companies)
+                    answer_dict = self._answer_single_company_question(
+                        company_name=resolved_companies[0],
+                        question_text=question_text,
+                        resolved_kind=resolved_kind,
+                        use_interactive_retrieval=False,
+                    )
+                else:
+                    answer_dict = self.answer_single_question(question_text, schema=schema)
+                if answer_dict.get("error"):
+                    raise ValueError(answer_dict["error"])
+                detail_ref = self._create_answer_detail_ref(answer_dict.get("detail", {}), question_index)
                 return {
                     "question_text": question_text,
-                    "kind": schema,
-                    "value": answer_dict.get("final_answer"),
+                    "kind": answer_dict.get("resolved_kind", schema),
+                    "value": answer_dict.get("value"),
+                    "answer_unit": answer_dict.get("answer_unit"),
+                    "unit_basis": answer_dict.get("unit_basis"),
                     "references": answer_dict.get("references", []),
                     "route": answer_dict.get("route"),
                     "status": answer_dict.get("status"),
-                    "resolved_company_names": answer_dict.get("resolved_company_names", []),
+                    "resolved_company_names": answer_dict.get("resolved_companies", []),
                     "answer_details": {"$ref": detail_ref},
                 }
 
+            answer_dict = self.process_question(question_text, schema)
+            detail_ref = self._create_answer_detail_ref(answer_dict, question_index)
             return {
                 "question": question_text,
                 "schema": schema,
@@ -914,6 +1479,7 @@ class QuestionsProcessor:
         with tqdm(total=total_questions, desc="Processing questions") as pbar:
             for i in range(0, total_questions, max(1, self.parallel_requests)):
                 batch = questions_with_index[i:i + max(1, self.parallel_requests)]
+                # 批处理层面额外限制并发，避免与检索/重排内部线程叠加后瞬时过载。
                 with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, self.parallel_requests)) as executor:
                     batch_results = list(executor.map(self._process_single_question, batch))
                 processed_questions.extend(batch_results)
@@ -1006,22 +1572,208 @@ class QuestionsProcessor:
             pipeline_details=pipeline_details,
         )
 
+    @staticmethod
+    def _detect_comparative_mode(question: str) -> str:
+        """识别比较题的可程序化类型。"""
+        question = question or ""
+        if "哪些公司同时" in question or "哪家公司同时" in question or "同时披露了" in question:
+            return "boolean_all_of"
+
+        numeric_compare_keywords = ["更高", "更低", "最高", "最低", "更大", "更小", "更多", "更少"]
+        if "哪家" in question or any(keyword in question for keyword in numeric_compare_keywords):
+            return "numeric_rank"
+
+        return "llm"
+
+    @staticmethod
+    def _is_higher_better_question(question: str) -> bool:
+        return any(keyword in (question or "") for keyword in ["更高", "最高", "更大", "更多", "更强"])
+
+    @staticmethod
+    def _is_lower_better_question(question: str) -> bool:
+        return any(keyword in (question or "") for keyword in ["更低", "最低", "更小", "更少"])
+
+    @staticmethod
+    def _build_boolean_comparative_sub_question(target_company: str, question: str) -> str:
+        """将“哪些公司同时……”类比较题改写为单公司的布尔问题。"""
+        question = question or ""
+        if "中，" in question:
+            tail = question.split("中，", 1)[1]
+        elif "中," in question:
+            tail = question.split("中,", 1)[1]
+        else:
+            tail = question
+
+        tail = re.sub(r"^哪些公司", f"{target_company}是否", tail)
+        tail = re.sub(r"^哪家公司", f"{target_company}是否", tail)
+        tail = tail.strip()
+        if not tail.startswith(target_company):
+            return f"{target_company}是否{tail}"
+        return tail
+
+    def _build_programmatic_numeric_comparative_answer(
+        self,
+        question: str,
+        companies: List[str],
+        individual_answers: Dict[str, dict],
+        references: List[dict],
+    ) -> dict:
+        """对数值高低比较题优先使用程序比较，避免再让模型比较已经标准化的数值。"""
+        comparable_items = []
+        relevant_pages = []
+        invalid_comparable_count = 0
+
+        for company in companies:
+            answer_dict = individual_answers.get(company, {})
+            final_answer = answer_dict.get("final_answer")
+            comparison_unit = self._get_numeric_comparison_unit(question, answer_dict)
+            if isinstance(final_answer, bool) or not isinstance(final_answer, (int, float)):
+                continue
+            if comparison_unit is None:
+                invalid_comparable_count += 1
+                continue
+            comparable_items.append((company, float(final_answer), answer_dict, comparison_unit))
+            relevant_pages.extend(answer_dict.get("relevant_pages", []))
+
+        if not comparable_items:
+            return {
+                "step_by_step_analysis": "1. 问题要求在多家公司之间比较数值。2. 逐一检查各公司的单公司答案。3. 当前没有足够的可比数值结果。4. 因此无法形成有效比较，只能返回 N/A。",
+                "reasoning_summary": "可比数值不足，无法完成程序比较。",
+                "relevant_pages": [],
+                "answer_type": "na",
+                "final_answer": "N/A",
+                "answer_unit": None,
+                "unit_basis": None,
+                "references": references,
+            }
+
+        comparable_units = {item[3] for item in comparable_items}
+        if invalid_comparable_count > 0 or len(comparable_units) != 1:
+            return {
+                "step_by_step_analysis": "1. 问题要求在多家公司之间比较同一指标。2. 我先检查各公司答案是否都是可比较的标准化数值。3. 当前可比较结果存在单位不一致或缺少标准单位。4. 为避免错误比较，本题返回 N/A。",
+                "reasoning_summary": "可比较数值的单位口径不一致，无法安全完成程序比较。",
+                "relevant_pages": sorted(set(relevant_pages))[:8],
+                "answer_type": "na",
+                "final_answer": "N/A",
+                "answer_unit": None,
+                "unit_basis": None,
+                "references": references,
+            }
+
+        if self._is_lower_better_question(question):
+            target_value = min(item[1] for item in comparable_items)
+        else:
+            target_value = max(item[1] for item in comparable_items)
+
+        winners = [item for item in comparable_items if item[1] == target_value]
+        if len(winners) != 1:
+            return {
+                "step_by_step_analysis": "1. 问题要求比较多家公司数值。2. 程序比较发现存在并列或无法唯一确定结果。3. 按保守策略不输出并列公司的主观选择。4. 因此返回 N/A。",
+                "reasoning_summary": "比较结果存在并列，无法唯一确定答案。",
+                "relevant_pages": sorted(set(relevant_pages))[:8],
+                "answer_type": "na",
+                "final_answer": "N/A",
+                "answer_unit": None,
+                "unit_basis": None,
+                "references": references,
+            }
+
+        winner_company, winner_value, winner_answer, _ = winners[0]
+        comparison_direction = "最低" if self._is_lower_better_question(question) else "最高"
+        return {
+            "step_by_step_analysis": (
+                f"1. 问题要求比较多家公司数值并找出{comparison_direction}者。"
+                f"2. 我先收集各公司的单公司标准化数值答案。"
+                f"3. 排除 N/A 或非数值结果后，对剩余公司直接做程序比较。"
+                f"4. 最终唯一结果为 {winner_company}，对应数值为 {winner_value}。"
+            ),
+            "reasoning_summary": f"程序比较可比数值后，{winner_company} 的结果为{comparison_direction}。",
+            "relevant_pages": sorted(set(winner_answer.get("relevant_pages", [])))[:8],
+            "answer_type": "text",
+            "final_answer": winner_company,
+            "answer_unit": None,
+            "unit_basis": None,
+            "references": references,
+        }
+
+    def _build_programmatic_boolean_comparative_answer(
+        self,
+        companies: List[str],
+        individual_answers: Dict[str, dict],
+        references: List[dict],
+    ) -> dict:
+        """对“哪些公司同时……”这类布尔筛选题优先使用程序汇总。"""
+        matched_companies = []
+        relevant_pages = []
+
+        for company in companies:
+            answer_dict = individual_answers.get(company, {})
+            if answer_dict.get("final_answer") is True:
+                matched_companies.append(company)
+                relevant_pages.extend(answer_dict.get("relevant_pages", []))
+
+        if not matched_companies:
+            return {
+                "step_by_step_analysis": "1. 问题要求筛选同时满足条件的公司。2. 我先查看各公司的单公司布尔判断结果。3. 当前没有公司被稳定判定为满足条件。4. 因此返回 N/A。",
+                "reasoning_summary": "没有公司被明确判定为同时满足条件。",
+                "relevant_pages": sorted(set(relevant_pages))[:8],
+                "answer_type": "na",
+                "final_answer": "N/A",
+                "answer_unit": None,
+                "unit_basis": None,
+                "references": references,
+            }
+
+        return {
+            "step_by_step_analysis": (
+                "1. 问题要求筛选同时满足条件的公司。"
+                "2. 我先将比较题改写为单公司的布尔问题。"
+                "3. 再收集每家公司的 True/False 结果。"
+                f"4. 最终筛选出满足条件的公司：{', '.join(matched_companies)}。"
+            ),
+            "reasoning_summary": f"程序汇总单公司布尔结果后，筛选出 {len(matched_companies)} 家符合条件的公司。",
+            "relevant_pages": sorted(set(relevant_pages))[:8],
+            "answer_type": "list",
+            "final_answer": matched_companies,
+            "answer_unit": None,
+            "unit_basis": None,
+            "references": references,
+        }
+
     def process_comparative_question(self, question: str, companies: List[str], schema: str) -> dict:
-        rephrased_questions = self.openai_processor.get_rephrased_questions(
-            original_question=question,
-            companies=companies,
-        )
         individual_answers = {}
         aggregated_references = []
+        comparative_mode = self._detect_comparative_mode(question)
+
+        def build_company_sub_question(target_company: str) -> str:
+            metric_text = question
+            for company in sorted(companies, key=len, reverse=True):
+                if company == target_company:
+                    continue
+                metric_text = metric_text.replace(company, "")
+
+            metric_text = re.sub('[\u3001,\uFF0C\u548C\u53CA\u4E0E]\s*', '', metric_text)
+            metric_text = re.sub('.*?(\u54EA\u5BB6|\u8C01\u7684)', '', metric_text)
+            metric_text = re.sub('\u5982\u679C.*$', '', metric_text).strip()
+            metric_text = re.sub('\u66F4\u9AD8|\u66F4\u4F4E|\u6700\u9AD8|\u6700\u4F4E|\u66F4\u5927|\u66F4\u5C0F|\u66F4\u5F3A|\u66F4\u591A|\u66F4\u5C11', '', metric_text)
+            metric_text = metric_text.strip(' :\uFF1A,\uFF0C\u3002\uFF1B;\uFF1F? ')
+
+            if not metric_text:
+                return f"{target_company}的该指标是多少？"
+            return f"{target_company}的{metric_text}是多少？"
 
         def process_company_question(company: str):
-            sub_question = rephrased_questions.get(company)
-            if not sub_question:
-                raise ValueError(f"Could not generate sub-question for company: {company}")
-            answer_dict = self.get_answer_for_company(company_name=company, question=sub_question, schema="number")
+            if comparative_mode == "boolean_all_of":
+                sub_question = self._build_boolean_comparative_sub_question(company, question)
+                sub_schema = "boolean"
+            else:
+                sub_question = build_company_sub_question(company)
+                sub_schema = "number"
+            answer_dict = self.get_answer_for_company(company_name=company, question=sub_question, schema=sub_schema)
             return company, answer_dict
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
+        comparative_workers = max(1, min(len(companies), 3))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=comparative_workers) as executor:
             future_to_company = {
                 executor.submit(process_company_question, company): company
                 for company in companies
@@ -1034,15 +1786,52 @@ class QuestionsProcessor:
         unique_refs = {}
         for ref in aggregated_references:
             unique_refs[(ref.get("pdf_sha1"), ref.get("page_index"))] = ref
+        unique_references = list(unique_refs.values())
 
-        comparative_answer = self.openai_processor.get_answer_from_rag_context(
+        if comparative_mode == "numeric_rank":
+            comparative_answer = self._build_programmatic_numeric_comparative_answer(
+                question=question,
+                companies=companies,
+                individual_answers=individual_answers,
+                references=unique_references,
+            )
+            comparative_answer["route"] = "comparative_programmatic"
+            comparative_answer["status"] = "answered" if comparative_answer.get("final_answer") != "N/A" else "insufficient_evidence"
+            comparative_answer["resolved_company_names"] = companies
+            return comparative_answer
+
+        if comparative_mode == "boolean_all_of":
+            comparative_answer = self._build_programmatic_boolean_comparative_answer(
+                companies=companies,
+                individual_answers=individual_answers,
+                references=unique_references,
+            )
+            comparative_answer["route"] = "comparative_programmatic"
+            comparative_answer["status"] = "answered" if comparative_answer.get("final_answer") != "N/A" else "insufficient_evidence"
+            comparative_answer["resolved_company_names"] = companies
+            return comparative_answer
+
+        comparison_context_parts = []
+        for company in companies:
+            answer_dict = individual_answers.get(company, {})
+            comparison_context_parts.append(
+                f"公司：{company}\n"
+                f"候选答案：{answer_dict.get('final_answer', 'N/A')}\n"
+                f"相关页码：{answer_dict.get('relevant_pages', [])}\n"
+                f"推理摘要：{answer_dict.get('reasoning_summary', '')}"
+            )
+        comparison_context = "\n\n---\n\n".join(comparison_context_parts)
+
+        comparative_answer = self.openai_processor.get_interactive_answer_from_rag_context(
             question=question,
-            rag_context=individual_answers,
-            schema="comparative",
+            rag_context=comparison_context,
+            companies=companies,
             model=self.answering_model,
+            question_kind_hint="comparative",
         )
+        comparative_answer = self._validate_answer_dict(question, "comparative", comparative_answer)
         self.response_data = self.openai_processor.response_data
-        comparative_answer["references"] = list(unique_refs.values())
+        comparative_answer["references"] = unique_references
         comparative_answer["route"] = "comparative"
         comparative_answer["status"] = "answered" if comparative_answer.get("final_answer") != "N/A" else "insufficient_evidence"
         comparative_answer["resolved_company_names"] = companies

@@ -54,6 +54,7 @@ def process_mineru_reports(source_dir: Path, config: str):
             "qwen_plus_rerank",
             "qwen_max_llm_top5",
             "qwen_max_ce_top5",
+            "qwen_max_ce_top5_rag_only",
         ]
     ),
     default="qwen_max_rerank",
@@ -61,7 +62,9 @@ def process_mineru_reports(source_dir: Path, config: str):
 def process_questions(config: str):
     root_path = Path.cwd()
     pipeline = Pipeline(root_path, run_config=configs[config])
-    click.echo(f"Processing questions (config={config})...")
+    click.echo(
+        f"Processing questions (config={config}, model={pipeline.run_config.answering_model})..."
+    )
     pipeline.process_questions()
 
 
@@ -75,6 +78,7 @@ def process_questions(config: str):
             "qwen_plus_rerank",
             "qwen_max_llm_top5",
             "qwen_max_ce_top5",
+            "qwen_max_ce_top5_rag_only",
         ]
     ),
     default="qwen_max_llm_top5",
@@ -85,14 +89,17 @@ def process_questions(config: str):
     default="auto",
 )
 def interactive_qa(config: str, schema: str):
-    # ?????????????????? data\test_set??????????????? subset ???
+    # 交互问答默认在当前数据集目录下运行，例如 data\test_set，
+    # 这样可以直接复用该目录中的 subset.csv、questions.json 和 databases。
     root_path = Path.cwd()
     pipeline = Pipeline(root_path, run_config=configs[config])
-    click.echo(f"Interactive QA started (config={config}, schema={schema})")
-    click.echo("?????????????? exit?quit ? ?? ???")
+    click.echo(
+        f"Interactive QA started (config={config}, model={pipeline.run_config.answering_model}, schema={schema})"
+    )
+    click.echo("请输入问题；输入 exit 或 quit 可退出交互问答。")
 
     while True:
-        question_text = click.prompt("??", prompt_suffix="> ", default="", show_default=False).strip()
+        question_text = click.prompt("问题", prompt_suffix="> ", default="", show_default=False).strip()
         if not question_text or question_text.lower() in {"exit", "quit"}:
             click.echo("Interactive QA stopped.")
             break

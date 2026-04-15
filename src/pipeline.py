@@ -18,6 +18,37 @@ load_dotenv()
 DEFAULT_LOCAL_BGE_M3_PATH = r'D:\AI_Cache\modelscope\BAAI\bge-m3'
 
 
+def _get_env_or_default(*env_keys: str, default: str) -> str:
+    """按优先级读取环境变量，找不到时返回默认值。"""
+    for env_key in env_keys:
+        value = os.getenv(env_key)
+        if value:
+            return value
+    return default
+
+
+def _resolve_answering_model(config_env_key: str, default_model: str) -> str:
+    """统一解析问答模型。
+
+    优先级说明：
+    1. 每个配置专属环境变量，例如 QWEN_MAX_LLM_TOP5_MODEL。
+    2. 全局环境变量 QWEN_CHAT_MODEL，可一键覆盖所有配置。
+    3. 代码中的默认模型兜底。
+    """
+    return _get_env_or_default(config_env_key, "QWEN_CHAT_MODEL", default=default_model)
+
+
+def _get_env_int(env_key: str, default: int) -> int:
+    """读取整数环境变量，解析失败时回退到默认值。"""
+    raw_value = os.getenv(env_key)
+    if not raw_value:
+        return default
+    try:
+        return int(raw_value)
+    except ValueError:
+        return default
+
+
 @dataclass
 class PipelinePaths:
     root_path: Path
@@ -41,13 +72,14 @@ class RunConfig:
     reranking_strategy: str = "llm"
     llm_reranking_sample_size: int = 24
     top_n_retrieval: int = 8
-    parallel_requests: int = 10
+    parallel_requests: int = 3
     api_provider: str = "qwen"
     answering_model: str = "qwen-max"
     embedding_model: str = DEFAULT_LOCAL_BGE_M3_PATH
     cross_encoder_model: str = "BAAI/bge-reranker-v2-m3"
     config_suffix: str = ""
     full_context: bool = False
+    enable_rule_shortcuts: bool = True
 
 
 class Pipeline:
@@ -151,7 +183,8 @@ class Pipeline:
             counter += 1
 
     def _build_questions_processor(self) -> QuestionsProcessor:
-        # ???????????????????????????????
+        # 批处理问答与交互问答共用同一套 QuestionsProcessor，
+        # 这样配置、提示词和输出结构都保持一致。
         return QuestionsProcessor(
             vector_db_dir=self.paths.vector_db_dir,
             documents_dir=self.paths.documents_dir,
@@ -170,13 +203,15 @@ class Pipeline:
             embedding_model=self.run_config.embedding_model,
             cross_encoder_model=self.run_config.cross_encoder_model,
             full_context=self.run_config.full_context,
+            enable_rule_shortcuts=self.run_config.enable_rule_shortcuts,
         )
 
     def process_questions(self):
         processor = self._build_questions_processor()
         output_path = self._get_next_available_filename(self.paths.answers_file_path)
         processor.process_all_questions(output_path=output_path, submission_file=False)
-        print(f"Answers saved to {output_path}")
+        debug_output_path = output_path.with_name(output_path.stem + "_debug" + output_path.suffix)
+        print(f"Debug answers saved to {debug_output_path}")
 
     def answer_single_question(self, question_text: str, schema: str | None = None) -> dict:
         processor = self._build_questions_processor()
@@ -189,8 +224,9 @@ configs = {
         parent_document_retrieval=True,
         llm_reranking=False,
         api_provider="qwen",
-        answering_model=os.getenv("QWEN_CHAT_MODEL", "qwen-max"),
+        answering_model=_resolve_answering_model("QWEN_DEFAULT_MODEL", "qwen-max"),
         embedding_model=os.getenv("EMBEDDING_MODEL", DEFAULT_LOCAL_BGE_M3_PATH),
+        parallel_requests=_get_env_int("QUESTION_PARALLEL_REQUESTS", 3),
         config_suffix="_qwen_default",
     ),
     "qwen_turbo": RunConfig(
@@ -198,8 +234,9 @@ configs = {
         parent_document_retrieval=True,
         llm_reranking=False,
         api_provider="qwen",
-        answering_model="qwen-turbo",
+        answering_model=_resolve_answering_model("QWEN_TURBO_MODEL", "qwen-turbo"),
         embedding_model=os.getenv("EMBEDDING_MODEL", DEFAULT_LOCAL_BGE_M3_PATH),
+        parallel_requests=_get_env_int("QUESTION_PARALLEL_REQUESTS", 3),
         config_suffix="_qwen_turbo",
     ),
     "qwen_max_rerank": RunConfig(
@@ -210,9 +247,10 @@ configs = {
         llm_reranking_sample_size=24,
         top_n_retrieval=8,
         api_provider="qwen",
-        answering_model="qwen-max",
+        answering_model=_resolve_answering_model("QWEN_MAX_RERANK_MODEL", "qwen-max"),
         embedding_model=os.getenv("EMBEDDING_MODEL", DEFAULT_LOCAL_BGE_M3_PATH),
         cross_encoder_model=os.getenv("CROSS_ENCODER_MODEL", "BAAI/bge-reranker-v2-m3"),
+        parallel_requests=_get_env_int("QUESTION_PARALLEL_REQUESTS", 3),
         config_suffix="_qwen_max_rerank",
     ),
     "qwen_plus_rerank": RunConfig(
@@ -223,9 +261,10 @@ configs = {
         llm_reranking_sample_size=18,
         top_n_retrieval=8,
         api_provider="qwen",
-        answering_model="qwen-plus",
+        answering_model=_resolve_answering_model("QWEN_PLUS_RERANK_MODEL", "qwen-plus"),
         embedding_model=os.getenv("EMBEDDING_MODEL", DEFAULT_LOCAL_BGE_M3_PATH),
         cross_encoder_model=os.getenv("CROSS_ENCODER_MODEL", "BAAI/bge-reranker-v2-m3"),
+        parallel_requests=_get_env_int("QUESTION_PARALLEL_REQUESTS", 3),
         config_suffix="_qwen_plus_rerank",
     ),
     "qwen_max_llm_top5": RunConfig(
@@ -236,23 +275,42 @@ configs = {
         llm_reranking_sample_size=5,
         top_n_retrieval=5,
         api_provider="qwen",
-        answering_model="qwen-max",
+        answering_model=_resolve_answering_model("QWEN_MAX_LLM_TOP5_MODEL", "qwen-max"),
         embedding_model=os.getenv("EMBEDDING_MODEL", DEFAULT_LOCAL_BGE_M3_PATH),
         cross_encoder_model=os.getenv("CROSS_ENCODER_MODEL", "BAAI/bge-reranker-v2-m3"),
+        parallel_requests=_get_env_int("QUESTION_PARALLEL_REQUESTS", 3),
         config_suffix="_qwen_max_llm_top5",
     ),
     "qwen_max_ce_top5": RunConfig(
         use_bm25_db=True,
-        parent_document_retrieval=True,
+        # 交叉编码器精排对长页文本开销较大，这里改为 chunk 级检索并缩小粗排候选数。
+        parent_document_retrieval=False,
         llm_reranking=True,
         reranking_strategy="cross_encoder",
-        llm_reranking_sample_size=30,
+        llm_reranking_sample_size=10,
         top_n_retrieval=5,
         api_provider="qwen",
-        answering_model="qwen-max",
+        answering_model=_resolve_answering_model("QWEN_MAX_CE_TOP5_MODEL", "qwen-max"),
         embedding_model=os.getenv("EMBEDDING_MODEL", DEFAULT_LOCAL_BGE_M3_PATH),
         cross_encoder_model=os.getenv("CROSS_ENCODER_MODEL", "BAAI/bge-reranker-v2-m3"),
+        parallel_requests=_get_env_int("QUESTION_PARALLEL_REQUESTS", 3),
         config_suffix="_qwen_max_ce_top5",
+    ),
+    "qwen_max_ce_top5_rag_only": RunConfig(
+        use_bm25_db=True,
+        # 纯 RAG 基线沿用当前交叉编码器配置，但显式关闭规则捷径，便于评估真实检索问答能力。
+        parent_document_retrieval=False,
+        llm_reranking=True,
+        reranking_strategy="cross_encoder",
+        llm_reranking_sample_size=10,
+        top_n_retrieval=5,
+        api_provider="qwen",
+        answering_model=_resolve_answering_model("QWEN_MAX_CE_TOP5_RAG_ONLY_MODEL", "qwen-max"),
+        embedding_model=os.getenv("EMBEDDING_MODEL", DEFAULT_LOCAL_BGE_M3_PATH),
+        cross_encoder_model=os.getenv("CROSS_ENCODER_MODEL", "BAAI/bge-reranker-v2-m3"),
+        parallel_requests=_get_env_int("QUESTION_PARALLEL_REQUESTS", 3),
+        config_suffix="_qwen_max_ce_top5_rag_only",
+        enable_rule_shortcuts=False,
     ),
 }
 

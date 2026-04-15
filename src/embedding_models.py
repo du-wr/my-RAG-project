@@ -1,6 +1,5 @@
 ﻿import os
 import threading
-import threading
 from typing import List, Union
 
 import numpy as np
@@ -11,7 +10,7 @@ from openai import OpenAI
 class EmbeddingClient:
     _local_model_cache = {}
     _local_model_lock = threading.Lock()
-    _local_model_lock = threading.Lock()
+    _local_encode_locks = {}
 
     def __init__(self, model_name: str):
         load_dotenv()
@@ -63,9 +62,19 @@ class EmbeddingClient:
             if cache_key not in cls._local_model_cache:
                 from sentence_transformers import SentenceTransformer
 
-                # ???????????????????????? meta tensor ???
+                # 统一复用本地模型实例，避免重复加载后出现显存浪费或 meta tensor 相关问题。
                 cls._local_model_cache[cache_key] = SentenceTransformer(model_name, device=device)
         return cls._local_model_cache[cache_key]
+
+    @classmethod
+    def _get_local_encode_lock(cls, model_name: str, device: str):
+        cache_key = (model_name, device)
+        with cls._local_model_lock:
+            if cache_key not in cls._local_encode_locks:
+                # 共享的 embedding 实例内部会复用 tokenizer 和缓冲区，
+                # 同一个实例被多个线程同时 encode 时容易触发并发借用错误。
+                cls._local_encode_locks[cache_key] = threading.Lock()
+        return cls._local_encode_locks[cache_key]
 
     def encode(self, texts: Union[str, List[str]]) -> List[List[float]]:
         if isinstance(texts, str):
@@ -78,12 +87,14 @@ class EmbeddingClient:
             device = self._resolve_local_device()
             local_model_name = self.model_name if os.path.isdir(self.model_name) else 'BAAI/bge-m3'
             model = self._get_local_model(local_model_name, device)
-            embeddings = model.encode(
-                texts,
-                normalize_embeddings=True,
-                convert_to_numpy=True,
-                show_progress_bar=False,
-            )
+            encode_lock = self._get_local_encode_lock(local_model_name, device)
+            with encode_lock:
+                embeddings = model.encode(
+                    texts,
+                    normalize_embeddings=True,
+                    convert_to_numpy=True,
+                    show_progress_bar=False,
+                )
             if isinstance(embeddings, np.ndarray):
                 return embeddings.astype(np.float32).tolist()
             return [np.asarray(item, dtype=np.float32).tolist() for item in embeddings]

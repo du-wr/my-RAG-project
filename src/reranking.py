@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -41,12 +42,17 @@ class LLMReranker:
         )
 
     @staticmethod
+    def _resolve_max_workers(item_count: int, upper_bound: int = 4) -> int:
+        """限制重排阶段的并发数，避免批处理时瞬时打爆配额。"""
+        return max(1, min(item_count, upper_bound))
+
+    @staticmethod
     def _normalize_single_block_result(payload: dict) -> dict:
         reasoning = (
             payload.get("reasoning")
             or payload.get("reasonining")
             or payload.get("analysis")
-            or "??????????"
+            or "模型未返回有效的相关性说明。"
         )
         relevance_score = payload.get("relevance_score", 0.0)
         try:
@@ -74,13 +80,13 @@ class LLMReranker:
             normalized.append(
                 {
                     "relevance_score": 0.0,
-                    "reasoning": "?????????????????????????",
+                    "reasoning": "模型未返回该文本块的有效评分结果。",
                 }
             )
         return {"block_rankings": normalized[:block_count]}
 
     def get_rank_for_single_block(self, query, retrieved_document):
-        user_prompt = f'???"{query}"\n\n??????\n"""\n{retrieved_document}\n"""'
+        user_prompt = f'问题："{query}"\n\n候选文本块：\n"""\n{retrieved_document}\n"""'
         completion = self._create_json_completion(self.system_prompt_rerank_single_block, user_prompt)
         content = completion.choices[0].message.content or '{}'
         payload = json.loads(content)
@@ -91,9 +97,9 @@ class LLMReranker:
             [f'Block {i + 1}:\n\n"""\n{text}\n"""' for i, text in enumerate(retrieved_documents)]
         )
         user_prompt = (
-            f'???"{query}"\n\n'
-            f"????????\n{formatted_blocks}\n\n"
-            f"????? {len(retrieved_documents)} ??? JSON ?????"
+            f'问题："{query}"\n\n'
+            f"下面是候选文本块：\n{formatted_blocks}\n\n"
+            f"请分别给出 {len(retrieved_documents)} 个 block 的 JSON 评分结果。"
         )
         completion = self._create_json_completion(self.system_prompt_rerank_multiple_blocks, user_prompt)
         content = completion.choices[0].message.content or '{}'
@@ -101,6 +107,9 @@ class LLMReranker:
         return self._normalize_multiple_blocks_result(payload, len(retrieved_documents))
 
     def rerank_documents(self, query: str, documents: list, documents_batch_size: int = 4, llm_weight: float = 0.7):
+        if not documents:
+            return []
+
         doc_batches = [documents[i:i + documents_batch_size] for i in range(0, len(documents), documents_batch_size)]
         vector_weight = 1 - llm_weight
 
@@ -115,7 +124,7 @@ class LLMReranker:
                 )
                 return doc_with_score
 
-            with ThreadPoolExecutor() as executor:
+            with ThreadPoolExecutor(max_workers=self._resolve_max_workers(len(documents))) as executor:
                 all_results = list(executor.map(process_single_doc, documents))
         else:
             def process_batch(batch):
@@ -127,7 +136,7 @@ class LLMReranker:
                     block_rankings.append(
                         {
                             "relevance_score": 0.0,
-                            "reasoning": "?????????????????????????",
+                            "reasoning": "模型未返回该文本块的有效评分结果。",
                         }
                     )
 
@@ -142,7 +151,7 @@ class LLMReranker:
                     results.append(doc_with_score)
                 return results
 
-            with ThreadPoolExecutor() as executor:
+            with ThreadPoolExecutor(max_workers=self._resolve_max_workers(len(doc_batches))) as executor:
                 batch_results = list(executor.map(process_batch, doc_batches))
             all_results = [item for batch in batch_results for item in batch]
 
@@ -152,12 +161,15 @@ class LLMReranker:
 
 class CrossEncoderReranker:
     _model_cache = {}
+    _cache_lock = threading.Lock()
+    _predict_locks = {}
 
     def __init__(self, model: str | None = None):
         load_dotenv()
         self.model_name = model or os.getenv("CROSS_ENCODER_MODEL", "BAAI/bge-reranker-v2-m3")
         self.device = self._resolve_device()
         self.model = self._get_model(self.model_name, self.device)
+        self._predict_lock = self._get_predict_lock(self.model_name, self.device)
 
     @staticmethod
     def _resolve_device() -> str:
@@ -178,18 +190,30 @@ class CrossEncoderReranker:
     @classmethod
     def _get_model(cls, model_name: str, device: str):
         cache_key = (model_name, device)
-        if cache_key not in cls._model_cache:
-            from sentence_transformers import CrossEncoder
+        with cls._cache_lock:
+            if cache_key not in cls._model_cache:
+                from sentence_transformers import CrossEncoder
 
-            cls._model_cache[cache_key] = CrossEncoder(model_name, device=device)
+                cls._model_cache[cache_key] = CrossEncoder(model_name, device=device)
         return cls._model_cache[cache_key]
+
+    @classmethod
+    def _get_predict_lock(cls, model_name: str, device: str):
+        cache_key = (model_name, device)
+        with cls._cache_lock:
+            if cache_key not in cls._predict_locks:
+                # 同一份 CrossEncoder 模型会在多个问题线程间共享，predict 时需要串行访问，
+                # 否则 sentence-transformers 可能在内部重复执行 `.to(device)`，触发 meta tensor 报错。
+                cls._predict_locks[cache_key] = threading.Lock()
+            return cls._predict_locks[cache_key]
 
     def rerank_documents(self, query: str, documents: list, top_n: int = 5):
         if not documents:
             return []
 
         sentence_pairs = [(query, document["text"]) for document in documents]
-        scores = self.model.predict(sentence_pairs, show_progress_bar=False)
+        with self._predict_lock:
+            scores = self.model.predict(sentence_pairs, show_progress_bar=False)
         scores = np.asarray(scores, dtype=np.float32)
 
         reranked_results = []

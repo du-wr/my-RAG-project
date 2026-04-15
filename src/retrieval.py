@@ -189,7 +189,7 @@ class HybridRetriever:
         company_name: str,
         query: str,
         llm_reranking_sample_size: int = 28,
-        documents_batch_size: int = 2,
+        documents_batch_size: int = 4,
         top_n: int = 6,
         llm_weight: float = 0.7,
         return_parent_pages: bool = False,
@@ -212,6 +212,8 @@ class HybridRetriever:
             bm25_results = []
 
         coarse_results = self._fuse_candidates_rrf(vector_results, bm25_results)[:llm_reranking_sample_size]
+        if not coarse_results:
+            return []
 
         if self.rerank_strategy == "cross_encoder":
             reranked_results = self.reranker.rerank_documents(
@@ -220,11 +222,11 @@ class HybridRetriever:
                 top_n=top_n,
             )
         else:
-            # Qwen ????????????? JSON ????????????
+            # 批量重排可以显著减少 Qwen 请求次数，降低 429 风险。
             reranked_results = self.reranker.rerank_documents(
                 query=query,
                 documents=coarse_results,
-                documents_batch_size=1,
+                documents_batch_size=documents_batch_size,
                 llm_weight=llm_weight,
             )
         return reranked_results[:top_n]
